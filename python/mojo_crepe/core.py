@@ -8,8 +8,7 @@ framing, and exposes `predict_from_activation` so a caller that has an
 activation matrix from any source gets crepe's pitch curve out of Mojo.
 
 The function names and formulas follow crepe 0.0.0 `core.py` exactly; the
-differences are dtype and the constant-frame edge case, both documented in the
-README.
+only difference is dtype, documented in the README.
 """
 
 from __future__ import annotations
@@ -45,18 +44,19 @@ def frame_normalize(audio, frame_len: int = FRAME_LEN,
     """Normalise a strided framing of `audio`, the framing `get_activation` uses.
 
     Returns a fresh (n_frames, frame_len) float64 array. Upstream builds the
-    same windows with `as_strided` and normalises them in place in float32;
-    overlapping windows cannot be normalised in place here, so the copy is
-    materialised and the arithmetic is done in float64.
+    same windows with `as_strided` and normalises them in float32, dividing
+    by `np.clip(std, 1e-8, None)`; overlapping windows cannot be normalised
+    in place here, so the copy is materialised and the arithmetic is done in
+    float64.
     """
     if hop is None:
         hop = int(MODEL_SRATE / 100)
     audio = np.asarray(audio, dtype=np.float64).ravel()
-    n_frames = 1 + int((audio.size - frame_len) / hop)
-    if n_frames < 1:
+    if audio.size < frame_len:
         raise ValueError(
             f"{audio.size} samples cannot fill a {frame_len}-sample frame"
         )
+    n_frames = 1 + int((audio.size - frame_len) / hop)
     return _lib.frame_normalize(audio, frame_len, hop, n_frames)
 
 
@@ -69,15 +69,30 @@ def activation_from_audio(audio, frame_len: int = FRAME_LEN,
 def to_local_average_cents(salience, center=None) -> np.ndarray:
     """Bin-to-cents map, `crepe.core.to_local_average_cents` for a whole matrix.
 
-    `center` is either None (use each row's first argmax) or a per-row sequence
-    of centre bins, which is what `to_viterbi_cents` passes.
+    `center` is either None (use each row's first argmax) or a per-row
+    sequence of centre bins, which is what `to_viterbi_cents` passes. A 1D
+    salience is the upstream single-row API: upstream returns a scalar, so
+    this does too. A 0D or 3D+ input is rejected with the same
+    `Exception("label should be either 1d or 2d ndarray")` upstream raises.
     """
-    salience = np.ascontiguousarray(salience, dtype=np.float64)
-    if salience.ndim == 1:
-        salience = salience.reshape(1, -1)
+    gss = np.asarray(salience, dtype=np.float64)
+    if gss.ndim == 1:
+        single_row = True
+        gss = gss.reshape(1, -1)
+    elif gss.ndim == 2:
+        single_row = False
+    else:
+        raise Exception("label should be either 1d or 2d ndarray")
+    salience = np.ascontiguousarray(gss)
+    if salience.shape[1] == 0:
+        raise ValueError("attempt to get argmax of an empty sequence")
     if center is None:
-        return _lib.local_cents(salience, HALF_WINDOW)
-    return _lib.local_cents_centred(salience, center, HALF_WINDOW)
+        out = _lib.local_cents(salience, HALF_WINDOW)
+    else:
+        out = _lib.local_cents_centred(salience, center, HALF_WINDOW)
+    if single_row:
+        return out[0]
+    return out
 
 
 def hmm_parameters(n_bins: int = N_BINS) -> tuple[np.ndarray, ...]:
@@ -108,6 +123,8 @@ def to_viterbi_cents(salience) -> np.ndarray:
     """`crepe.core.to_viterbi_cents`: argmax observations, Viterbi, then the
     same local cents average taken around the decoded bin."""
     salience = np.ascontiguousarray(salience, dtype=np.float64)
+    if salience.shape[1] == 0:
+        raise ValueError("attempt to get argmax of an empty sequence")
     observations = np.argmax(salience, axis=1).astype(np.int32)
     log_start, log_trans, log_emis_t = hmm_parameters(salience.shape[1])
     path = _lib.viterbi(observations, log_trans, log_emis_t, log_start)
@@ -117,6 +134,8 @@ def to_viterbi_cents(salience) -> np.ndarray:
 def viterbi_path(salience) -> np.ndarray:
     """The decoded bin path itself, which upstream never returns."""
     salience = np.ascontiguousarray(salience, dtype=np.float64)
+    if salience.shape[1] == 0:
+        raise ValueError("attempt to get argmax of an empty sequence")
     observations = np.argmax(salience, axis=1).astype(np.int32)
     log_start, log_trans, log_emis_t = hmm_parameters(salience.shape[1])
     return _lib.viterbi(observations, log_trans, log_emis_t, log_start)
@@ -130,6 +149,10 @@ def cents_to_hz(cents) -> np.ndarray:
 def row_max(salience) -> np.ndarray:
     """`activation.max(axis=1)`, the confidence curve."""
     salience = np.ascontiguousarray(salience, dtype=np.float64)
+    if salience.shape[1] == 0:
+        raise ValueError(
+            "zero-size array to reduction operation maximum which has no identity"
+        )
     return _lib.row_max(salience)
 
 

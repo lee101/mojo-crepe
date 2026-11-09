@@ -77,8 +77,9 @@ def test_frame_normalize_tail_frame_is_complete():
 
 
 def test_frame_normalize_constant_frame_is_zero():
-    """Documented divergence from NumPy: a silent frame would be 0/0 = NaN
-    there, and is all-zero here."""
+    """`get_activation` divides by `np.clip(std, 1e-8, None)`, so a silent
+    frame is `(x - mean) / 1e-8`, which is exactly zero when the samples are
+    exactly representable (ones: mean 1.0, differences 0.0)."""
     audio = np.ones(4096)
     frames = mc.frame_normalize(audio)
     assert np.all(frames == 0.0)
@@ -101,6 +102,55 @@ def test_frame_normalize_float32_input():
     np.testing.assert_allclose(
         got, ref.ref_frame_normalize(narrow), rtol=1e-5, atol=1e-5
     )
+
+
+def test_frame_normalize_clips_std_at_1e_minus_8():
+    """`get_activation` divides by `np.clip(std, 1e-8, None)`: a frame whose
+    std is ~3e-14 (one sample differing by 1e-12) is scaled by 1e8, not by
+    1/std, so its output magnitude stays near 1e-4. A kernel that divides by
+    the raw std would report values around 32. The tolerance is loose because
+    the numerator is a catastrophic-cancellation quantity: sequential and
+    pairwise summation order differ by a few ulps, which dominates the
+    relative error once amplified by 1e8."""
+    audio = np.zeros(mc.FRAME_LEN)
+    audio[0] = 1e-12
+    got = mc.frame_normalize(audio)
+    expect = ref.ref_frame_normalize(audio[None, :])
+    np.testing.assert_allclose(got, expect, rtol=1.0, atol=1e-3)
+    assert np.abs(got).max() < 1e-3
+
+
+def test_frame_normalize_non_representable_constant_is_tiny_not_nan():
+    """A window of 0.1 has a sequential-sum mean that is not exactly 0.1, so
+    the numerator is ~1e-17; dividing by the clipped 1e-8 leaves values
+    around 1e-9, never NaN from a 0/0. Upstream on the same window gives the
+    same magnitude in float64."""
+    audio = np.full(4096, 0.1)
+    got = mc.frame_normalize(audio)
+    expect = ref.ref_frame_normalize(np.full((1, mc.FRAME_LEN), 0.1))
+    np.testing.assert_allclose(got[0], expect[0], rtol=1.0, atol=1e-6)
+    assert np.all(np.abs(got) < 1e-6)
+
+
+def test_frame_normalize_nan_frames_is_nan():
+    """A NaN in the window poisons mean and std through the clip, so upstream
+    returns NaN; the port must too."""
+    audio = np.full(4096, np.nan)
+    got = mc.frame_normalize(audio)
+    assert got.shape[0] >= 1
+    assert np.all(np.isnan(got))
+
+
+def test_frame_normalize_inf_frames_is_nan():
+    """An infinite sample makes `x - mean` an `inf - inf` difference, so the
+    clipped std is NaN and upstream returns NaN; the port matches."""
+    audio = np.zeros(4096)
+    audio[100] = np.inf
+    got = mc.frame_normalize(audio)
+    assert np.all(np.isnan(got[0]))
+    audio = np.full(4096, np.inf)
+    got = mc.frame_normalize(audio)
+    assert np.all(np.isnan(got))
 
 
 # --------------------------------------------------------- local cents ------
@@ -354,3 +404,273 @@ def test_predict_default_branch_is_local_average():
 def test_predict_rejects_too_short_audio():
     with pytest.raises(ValueError):
         mc.frame_normalize(np.zeros(100))
+
+
+# -------------------------------------------------- degenerate inputs -----
+
+
+def test_frame_normalize_empty_and_partial_frames_raise_valueerror():
+    """Upstream's `n_frames = 1 + int((len(audio) - 1024) / hop_length)`
+    followed by `as_strided` with a negative or oversized frame count
+    raises `ValueError` for inputs shorter than one frame (the oversized
+    case reads out of bounds, which the port rejects rather than trusting
+    memory past the buffer)."""
+    with pytest.raises(ValueError, match="cannot fill a"):
+        mc.frame_normalize(np.zeros(0))
+    with pytest.raises(ValueError, match="cannot fill a"):
+        mc.frame_normalize(np.zeros(mc.FRAME_LEN - 1))
+
+
+def test_frame_normalize_single_frame_boundary():
+    """Exactly one frame is the smallest valid input; the last input length
+    that still yields one frame is 1024 + hop - 1 = 1183."""
+    rng = np.random.default_rng(31)
+    audio = rng.standard_normal(mc.FRAME_LEN)
+    got = mc.frame_normalize(audio)
+    assert got.shape == (1, mc.FRAME_LEN)
+    np.testing.assert_allclose(
+        got, ref.ref_frame_normalize(audio[None, :].astype(np.float64)),
+        rtol=1e-12, atol=1e-12,
+    )
+    longest_one = mc.FRAME_LEN + mc.MODEL_SRATE // 100 - 1
+    assert mc.frame_normalize(rng.standard_normal(longest_one)).shape[0] == 1
+    assert mc.frame_normalize(rng.standard_normal(longest_one + 1)).shape[0] == 2
+
+
+def test_frame_normalize_raises_same_valueerror_as_upstream_framing():
+    """For inputs shorter than a frame, upstream's `as_strided` window
+    shape goes negative and NumPy raises `ValueError: negative dimensions
+    are not allowed`. The port raises the same class of error."""
+    for n in (0, 100, mc.FRAME_LEN - 1):
+        with pytest.raises(ValueError):
+            mc.frame_normalize(np.zeros(n))
+
+
+def test_local_cents_empty_matrix_matches_upstream():
+    """Upstream's 2D branch is a list comprehension over rows: zero rows
+    give `np.array([])`, an empty float64 array, not an error."""
+    expect = ref.ref_local_average_cents(np.empty((0, mc.N_BINS)))
+    got = mc.to_local_average_cents(np.empty((0, mc.N_BINS)))
+    assert got.shape == expect.shape == (0,)
+
+
+def test_local_cents_zero_width_row_raises_like_numpy_argmax():
+    """`np.argmax` on an empty row raises `ValueError: attempt to get
+    argmax of an empty sequence`; the port surfaces the same."""
+    with pytest.raises(ValueError, match="argmax"):
+        mc.to_local_average_cents(np.empty((1, 0)))
+
+
+def test_local_cents_1d_returns_scalar_like_upstream():
+    """Upstream's 1D branch returns `product_sum / weight_sum`, a float64
+    scalar, not an array. The port's matrix entry point still accepts a
+    single row but its return must be scalar for parity."""
+    rng = np.random.default_rng(37)
+    row = rng.random(mc.N_BINS)
+    got = mc.to_local_average_cents(row)
+    assert np.ndim(got) == 0
+    # upstream's 1D expression, transcribed from core.py
+    mapping = ref.cents_mapping()
+    center = int(np.argmax(row))
+    start, end = max(0, center - 4), min(len(row), center + 5)
+    expect = np.sum(row[start:end] * mapping[start:end]) / np.sum(row[start:end])
+    np.testing.assert_allclose(got, expect, rtol=1e-12)
+
+
+def test_local_cents_1d_centred_scalar():
+    """The centred branch of the upstream 1D API: `to_local_average_cents(
+    salience[i], path[i])`, one row at a time."""
+    rng = np.random.default_rng(39)
+    row = rng.random(mc.N_BINS)
+    got = mc.to_local_average_cents(row, np.array([150]))
+    mapping = ref.cents_mapping()
+    window = row[146:155]
+    expect = np.sum(window * mapping[146:155]) / np.sum(window)
+    np.testing.assert_allclose(got, expect, rtol=1e-12)
+
+
+def test_local_cents_rejects_0d_and_3d_like_upstream():
+    """Upstream raises `Exception("label should be either 1d or 2d
+    ndarray")` for any other rank."""
+    with pytest.raises(Exception, match="label should be either 1d or 2d"):
+        mc.to_local_average_cents(np.float64(1.0))
+    with pytest.raises(Exception, match="label should be either 1d or 2d"):
+        mc.to_local_average_cents(np.ones((2, 3, mc.N_BINS)))
+
+
+def test_local_cents_zero_weight_row_is_nan_like_upstream():
+    """An all-zero window gives `0 / 0 = NaN` in upstream's
+    `product_sum / weight_sum`; the port produces the same NaN."""
+    got = mc.to_local_average_cents(np.zeros((2, mc.N_BINS)))
+    assert np.all(np.isnan(got))
+
+
+def test_local_cents_nan_argmax_propagates_like_numpy():
+    """Modern `np.argmax` propagates NaN (the first NaN wins over any finite
+    value and over +inf); the port's argmax must too, so the weighted
+    average over the NaN's window is NaN like upstream."""
+    for row, in_nan_vs_ref in (
+        (np.array([[1.0] * 359 + [np.nan]]), None),
+        (np.array([[np.nan] + [1.0] * 359]), None),
+        (np.array([[1.0] * 100 + [np.nan] + [1.0] * 259]), None),
+    ):
+        got = mc.to_local_average_cents(row)
+        expect = ref.ref_local_average_cents(row)
+        assert np.isnan(got[0]) and np.isnan(expect[0])
+
+
+def test_local_cents_inf_row_parity():
+    """A +inf salience entry dominates both the argmax and the window
+    weights; the port's weighted mean matches the NumPy reference."""
+    row = np.ones((1, mc.N_BINS))
+    row[0, 180] = np.inf
+    got = mc.to_local_average_cents(row)
+    expect = ref.ref_local_average_cents(row)
+    assert np.isnan(got[0]) and np.isnan(expect[0])  # inf-weighted mean
+    row = np.full((1, mc.N_BINS), np.inf)
+    got = mc.to_local_average_cents(row)
+    expect = ref.ref_local_average_cents(row)
+    np.testing.assert_allclose(got, expect, equal_nan=True, rtol=1e-12, atol=1e-9)
+
+
+def test_local_cents_duplicate_max_takes_first_like_upstream():
+    """Duplicates: an all-equal row's argmax is bin 0 under the first-max
+    rule, so the result is the mean of the mapping over bins 0..4."""
+    got = mc.to_local_average_cents(np.full((2, mc.N_BINS), 3.0))
+    expect = ref.ref_local_average_cents(np.full((2, mc.N_BINS), 3.0))
+    np.testing.assert_allclose(got, expect, rtol=1e-12)
+    mapping = ref.cents_mapping()
+    np.testing.assert_allclose(got, mapping[0:5].mean(), rtol=1e-12)
+
+
+def test_local_cents_out_of_range_centre_matches_upstream_clipping():
+    """Upstream clips the window with `start = max(0, centre-4)` and
+    `end = min(len, centre+5)`, so centre 360 averages bins 356..359 and
+    centre -1 averages bins 0..3, while a centre far outside produces an
+    empty window and 0/0 = NaN."""
+    act = np.ones((1, mc.N_BINS))
+    np.testing.assert_allclose(
+        mc.to_local_average_cents(act, np.array([mc.N_BINS])),
+        ref.ref_local_average_cents(act, np.array([mc.N_BINS])),
+        rtol=1e-12,
+    )
+    np.testing.assert_allclose(
+        mc.to_local_average_cents(act, np.array([-1])),
+        ref.ref_local_average_cents(act, np.array([-1])),
+        rtol=1e-12,
+    )
+    got = mc.to_local_average_cents(act, np.array([1000]))
+    expect = ref.ref_local_average_cents(act, np.array([1000]))
+    assert np.isnan(got[0]) and np.isnan(expect[0])
+
+
+def test_row_max_empty_and_zero_width():
+    """`activation.max(axis=1)` on (0, 360) is the empty vector; on (1, 0)
+    NumPy raises `ValueError` because maximum has no identity. Status of
+    the port: rows are never empty in production (the CNN emits 360), so
+    the empty-rows case is returned and the zero-width case raises."""
+    got = mc.row_max(np.empty((0, mc.N_BINS)))
+    assert got.shape == (0,)
+    with pytest.raises(ValueError, match="zero-size"):
+        mc.row_max(np.empty((1, 0)))
+
+
+def test_row_max_nan_propagates_like_numpy_max():
+    """`np.max` propagates NaN anywhere in the row; the port must agree
+    instead of returning the largest finite value."""
+    for row in (
+        np.array([[np.nan, 1.0, 2.0]]),
+        np.array([[1.0, np.nan, 2.0]]),
+        np.array([[1.0, 2.0, np.nan]]),
+    ):
+        got = mc.row_max(row)
+        expect = ref.ref_row_max(row)
+        assert np.isnan(got[0]) and np.isnan(expect[0])
+
+
+def test_row_max_inf_and_negatives_parity():
+    rng = np.random.default_rng(41)
+    act = rng.random((9, mc.N_BINS)) * 2.0 - 1.0
+    act[0, ::2] = -np.inf
+    act[1, 10] = np.inf
+    np.testing.assert_array_equal(mc.row_max(act), ref.ref_row_max(act))
+
+
+def test_cents_to_hz_inf_and_neg_inf_match_power_expression():
+    """`10 * 2 ** (cents / 1200)` is +inf at +inf and 0 at -inf; a kernel
+    that delegates both to a single `exp2` approximation returns 10 for
+    each, so the infinities need their own branches."""
+    got = mc.cents_to_hz(np.array([np.inf, -np.inf]))
+    expect = ref.ref_cents_to_hz(np.array([np.inf, -np.inf]))
+    np.testing.assert_array_equal(got, expect)
+    assert np.isposinf(got[0]) and got[1] == 0.0
+
+
+def test_cents_to_hz_empty():
+    got = mc.cents_to_hz(np.array([]))
+    assert got.shape == (0,)
+
+
+def test_hmm_parameters_parity_with_probability_space_reference():
+    """`hmm_parameters` is the log-domain twin of upstream's probability
+    matrices: `log(starting)`, `log(transition)`, and the transposed
+    `log(emission)`, each agreeing with `np.log` of the reference to
+    double precision."""
+    for n in (3, 360):
+        log_start, log_trans, log_emis_t = mc.hmm_parameters(n)
+        start, trans, emis = ref.ref_hmm_parameters(n)
+        with np.errstate(divide="ignore"):
+            np.testing.assert_allclose(log_start, np.log(start), rtol=1e-12)
+            np.testing.assert_allclose(
+                log_trans, np.log(trans), rtol=1e-12, equal_nan=True
+            )
+            np.testing.assert_allclose(log_emis_t, np.log(emis).T, rtol=1e-12)
+
+
+def test_activation_from_audio_is_frame_normalize_alias():
+    rng = np.random.default_rng(43)
+    audio = _audio(seed=43)
+    np.testing.assert_array_equal(
+        mc.activation_from_audio(audio), mc.frame_normalize(audio)
+    )
+
+
+def test_to_viterbi_cents_parity_against_reference_composition():
+    """`to_viterbi_cents` is argmax -> Viterbi decode -> centred local
+    cents; compare the whole composition against the NumPy reference."""
+    rng = np.random.default_rng(47)
+    act = rng.random((33, mc.N_BINS))
+    path = ref.ref_viterbi_path(np.argmax(act, axis=1))
+    expect = ref.ref_local_average_cents(act, path)
+    np.testing.assert_allclose(
+        mc.to_viterbi_cents(act), expect, rtol=1e-12, atol=1e-9
+    )
+
+
+def test_viterbi_empty_matrix():
+    """Zero frames: `np.argmax` on (0, 360) is empty, so the decode is an
+    empty path and the cents/cents-to-Hz pipeline returns empty arrays."""
+    act = np.empty((0, mc.N_BINS))
+    assert mc.viterbi_path(act).shape == (0,)
+    assert mc.to_viterbi_cents(act).shape == (0,)
+    time, freq, conf, _ = mc.predict_from_activation(act, viterbi=True)
+    assert time.shape == freq.shape == conf.shape == (0,)
+    assert np.array_equal(freq, np.array([]))
+
+
+def test_viterbi_zero_width_raises_like_argmax():
+    """`np.argmax(salience, axis=1)` on a (T, 0) matrix raises `ValueError:
+    attempt to get argmax of an empty sequence`."""
+    with pytest.raises(ValueError, match="argmax"):
+        mc.viterbi_path(np.empty((1, 0)))
+    with pytest.raises(ValueError, match="argmax"):
+        mc.to_viterbi_cents(np.empty((1, 0)))
+
+
+def test_predict_rejects_3d_activation_like_upstream_max_axis():
+    """`activation.max(axis=1)` on a 3D array has no axis 1 issue, but
+    `np.argmax(..., axis=1)` on the 2D contract rejects the rank: the
+    port's shape unpack raises `ValueError` on the (T, 360) expectation,
+    matching the AxisError family upstream would raise downstream."""
+    with pytest.raises(ValueError):
+        mc.predict_from_activation(np.ones((2, 3, mc.N_BINS)))

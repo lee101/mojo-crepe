@@ -23,15 +23,26 @@ def cents_mapping() -> np.ndarray:
 
 def ref_frame_normalize(frames: np.ndarray) -> np.ndarray:
     """crepe.core.get_activation: `frames -= mean(axis=1)[:, None]` then
-    `frames /= std(axis=1)[:, None]` on the strided framing."""
+    `frames /= np.clip(std(axis=1)[:, None], 1e-8, None)` on the strided
+    framing. Note the `np.clip(std, 1e-8, None)`: a constant frame divides
+    by 1e-8, not by 0, so silence maps to all-zero frames, not NaN.
+    """
     frames = np.array(frames, dtype=np.float64, copy=True)
     frames -= np.mean(frames, axis=1)[:, np.newaxis]
-    frames /= np.std(frames, axis=1)[:, np.newaxis]
+    frames /= np.clip(np.std(frames, axis=1)[:, np.newaxis], 1e-8, None)
     return frames
 
 
 def ref_local_average_cents(salience: np.ndarray, center=None) -> np.ndarray:
-    """crepe.core.to_local_average_cents, row by row."""
+    """crepe.core.to_local_average_cents, row by row.
+
+    Upstream's 1D branch handles a single salience row and, when `center`
+    is given, averages the 9-bin window around it; its 2D branch calls that
+    same 1D branch per row. The port implements the same row-wise
+    computation for a matrix (row `i` centred on `center[i]`), which is
+    what upstream's `to_viterbi_cents` composes per row, so this reference
+    takes a per-row `center` array for the 2D case.
+    """
     salience = np.asarray(salience, dtype=np.float64)
     mapping = cents_mapping()
     out = np.empty(salience.shape[0], dtype=np.float64)

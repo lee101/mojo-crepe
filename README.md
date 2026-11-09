@@ -43,10 +43,10 @@ numbers, so an activation matrix from any source (the real CNN, a cached
   salience is a float32 matrix. This port is float64 throughout, which is the
   more accurate of the two and one dtype conversion away from upstream. The
   tests pin both behaviours.
-- **Constant frames.** A 1024-sample window of silence has zero variance, so
-  upstream produces `0/0 = NaN` and a warning. This port emits an all-zero
-  frame. This is the one place the output differs, and it only differs where
-  upstream's output is undefined.
+- **Constant frames.** `get_activation` divides by `np.clip(std, 1e-8, None)`,
+  not by the raw std, so a silent window is `(x - mean) / 1e-8 = 0`, not NaN.
+  This port applies the same clip; a frame whose std falls below 1e-8 is
+  normalised against 1e-8 rather than amplified to unit variance.
 - **Tie-breaking in the Viterbi decode.** Upstream hands the decode to
   `hmmlearn`; this port implements the standard log-domain max-product
   formulation and keeps the lower predecessor on a tie, matching `np.argmax`

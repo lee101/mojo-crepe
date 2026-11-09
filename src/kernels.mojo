@@ -68,15 +68,14 @@ def crepe_frame_normalize(
         for i in range(frame_len):
             var d = x[unsafe_offset=base + i] - mean
             sq = d * d + sq
+        # clip std at 1e-8, as crepe.core.get_activation does (np.clip(std, 1e-8, None))
         var sd = sqrt(sq / fl)
-        if sd > Float64(0.0):
-            for i in range(frame_len):
-                dst[unsafe_offset=wbase + i] = (
-                    x[unsafe_offset=base + i] - mean
-                ) / sd
-        else:
-            for i in range(frame_len):
-                dst[unsafe_offset=wbase + i] = Float64(0.0)
+        if sd < Float64(1e-8):
+            sd = Float64(1e-8)
+        for i in range(frame_len):
+            dst[unsafe_offset=wbase + i] = (
+                x[unsafe_offset=base + i] - mean
+            ) / sd
 
 
 @export("crepe_local_cents")
@@ -96,9 +95,13 @@ def crepe_local_cents(
         var base = t * n_bins
         var center = 0
         var best = act[unsafe_offset=base]
+        # np.argmax propagates NaN (first NaN wins), as crepe.core.to_local_average_cents does
         for j in range(1, n_bins):
             var v = act[unsafe_offset=base + j]
-            if v > best:
+            if v != v:
+                best = v
+                center = j
+            elif v > best:
                 best = v
                 center = j
         var start = center - half
@@ -204,10 +207,15 @@ def crepe_cents_to_hz(cents_addr: Int, n: Int, out_addr: Int) abi("C"):
     """`10 * 2 ** (cents / 1200)`, with NaN mapped to 0 as `predict` does."""
     var cents = fp(cents_addr)
     var dst = fp(out_addr)
+    var inf = Float64(1.0) / Float64(0.0)  # 10 * 2 ** (inf / 1200) -> inf
     for i in range(n):
         var c = cents[unsafe_offset=i]
         if c != c:
             dst[unsafe_offset=i] = Float64(0.0)
+        elif c == inf:
+            dst[unsafe_offset=i] = inf
+        elif c == -inf:
+            dst[unsafe_offset=i] = Float64(0.0)  # 10 * 2 ** (-inf) -> 0
         else:
             dst[unsafe_offset=i] = Float64(10.0) * exp2(c / Float64(1200.0))
 
@@ -220,8 +228,11 @@ def crepe_row_max(act_addr: Int, n_rows: Int, n_bins: Int, out_addr: Int) abi("C
     for t in range(n_rows):
         var base = t * n_bins
         var best = act[unsafe_offset=base]
+        # np.max propagates NaN, as crepe.core.predict's activation.max(axis=1) does
         for j in range(1, n_bins):
             var v = act[unsafe_offset=base + j]
-            if v > best:
+            if v != v:
+                best = v
+            elif v > best:
                 best = v
         dst[unsafe_offset=t] = best
