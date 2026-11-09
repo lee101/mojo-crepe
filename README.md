@@ -82,7 +82,7 @@ decoded bin path, which upstream never exposes.
 
 ## Tests
 
-28 tests. `crepe` cannot be imported in the test venv — `crepe.core` imports
+56 tests (53 functions, 4 parametrized octave cases). `crepe` cannot be imported in the test venv — `crepe.core` imports
 keras, hmmlearn and resampy at module scope, and `crepe` is not installed at
 all — so `tests/upstream_ref.py` is a line-for-line NumPy transcription of the
 upstream expressions it mirrors (`to_local_average_cents`, `to_viterbi_cents`,
@@ -113,11 +113,11 @@ broadcast max for the decode), not per-row Python loops.
 
 | case | numpy | mojo-crepe | ratio |
 | --- | ---: | ---: | ---: |
-| frame-normalize, 30 s audio | 68.9 ms | 18.7 ms | 3.68x |
-| local-average-cents, 3000x360 | 3.47 ms | 2.79 ms | 1.25x |
-| viterbi decode, 1000 frames | 1455 ms | 636 ms | 2.29x |
-| cents-to-hz, n=1048576 | 134 ms | 67.0 ms | 2.00x |
-| predict tail, 2000 frames | 3168 ms | 603 ms | 5.26x |
+| frame-normalize, 30 s audio | 38.36 ms | 15.61 ms | 2.46x |
+| local-average-cents, 3000x360 | 1.37 ms | 2.24 ms | 0.61x |
+| viterbi decode, 1000 frames | 442.70 ms | 117.87 ms | 3.76x |
+| cents-to-hz, n=1048576 | 37.24 ms | 26.69 ms | 1.40x |
+| predict tail, 2000 frames | 852.94 ms | 227.27 ms | 3.75x |
 
 The frame normalisation is the clearest win: it is three passes over
 contiguous data that NumPy has to make through a strided view, and the read,
@@ -126,5 +126,9 @@ decode is sequential in frames — frame `t` depends on frame `t - 1` — so it 
 one serial kernel with no thread pool; the win there is from reading both
 matrices row-major in the inner loop instead of NumPy's broadcast temporary.
 
-Measured on a shared 72-core Xeon E5-2697 v4; run-to-run spread on this box is
-a few percent.
+Measured 2026-11-09 with `pixi run bench` on a shared 72-core Xeon E5-2697 v4
+(NumPy 2.5.1, Python 3.13). See `bench/verify.md` for the reruns, the
+run-to-run spread (Mojo column ~5%, NumPy column up to ~20% on this shared
+box), and the >20% corrections to the previous figures. The
+local-average-cents row is slower than the NumPy reference (0.61x) and is
+kept in the table as measured.
