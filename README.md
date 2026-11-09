@@ -113,7 +113,7 @@ broadcast max for the decode), not per-row Python loops.
 
 | case | numpy | mojo-crepe | ratio |
 | --- | ---: | ---: | ---: |
-| frame-normalize, 30 s audio | 38.36 ms | 15.61 ms | 2.46x |
+| frame-normalize, 30 s audio | 28.90 ms | 15.61 ms | 2.06x |
 | local-average-cents, 3000x360 | 1.37 ms | 2.24 ms | 0.61x |
 | viterbi decode, 1000 frames | 442.70 ms | 117.87 ms | 3.76x |
 | cents-to-hz, n=1048576 | 37.24 ms | 26.69 ms | 1.40x |
@@ -128,7 +128,10 @@ matrices row-major in the inner loop instead of NumPy's broadcast temporary.
 
 Measured 2026-11-09 with `pixi run bench` on a shared 72-core Xeon E5-2697 v4
 (NumPy 2.5.1, Python 3.13). See `bench/verify.md` for the reruns, the
-run-to-run spread (Mojo column ~5%, NumPy column up to ~20% on this shared
-box), and the >20% corrections to the previous figures. The
+run-to-run spread (Mojo column ~5%, NumPy column up to ~25% on the
+frame-normalize row on this shared box), and the >20% corrections to the
+previous figures: the frame-normalize NumPy cell was 38.36 ms in the first
+verify pass and 28.90 ms here, so that cell and its ratio were re-corrected
+to the number measured in this session's `pixi run bench` run. The
 local-average-cents row is slower than the NumPy reference (0.61x) and is
 kept in the table as measured.
